@@ -1,0 +1,584 @@
+# Keycloak + Supabase Integration
+
+## How This Integration Works (Simple Explanation)
+
+```
+WITHOUT INTEGRATION (now):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+User → Supabase Auth (its own login system)
+User → Keycloak (separate login)
+Two separate auth systems = mess
+
+WITH INTEGRATION (goal):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+User → Keycloak (ONE login)
+         ↓ issues JWT token
+Supabase → "I trust Keycloak tokens"
+         ↓ validates token
+AIOps Data → accessible only if token valid
+
+Flow:
+1. User logs into Keycloak
+2. Gets JWT token
+3. Sends token to Supabase API
+4. Supabase verifies token with Keycloak
+5. Data returned or access denied
+```
+
+---
+
+# PHASE 1 — Configure Keycloak Side
+
+## Step 1: Create Supabase Client in Keycloak
+
+```bash
+# Login to Keycloak admin console
+# https://<your-keycloak-route>/admin
+# Username: admin / Password: Admin@12345
+
+# Go to: aiops-dev realm → Clients → Create client
+```
+
+Fill in the form:
+```
+Client type:        OpenID Connect
+Client ID:          supabase
+Name:               Supabase AIOps
+Description:        Supabase integration client
+Click Next
+```
+
+Capability config:
+```
+Client authentication:    ON  (confidential client)
+Standard flow:            ON
+Direct access grants:     ON
+Implicit flow:            OFF
+Click Next
+```
+
+Login settings:
+```
+Root URL:
+  https://<your-supabase-studio-route>
+
+Valid redirect URIs:
+  https://<your-supabase-studio-route>/*
+  http://localhost:3000/*
+
+Valid post logout redirect URIs:
+  https://<your-supabase-studio-route>/*
+
+Web origins:
+  https://<your-supabase-studio-route>
+Click Save
+```
+
+---
+
+## Step 2: Get Client Secret
+
+```
+Clients → supabase → Credentials tab
+Copy the Client Secret value
+Save it — we need it later
+```
+
+---
+
+## Step 3: Configure Token Claims (VERY IMPORTANT)
+
+Supabase needs specific claims inside the JWT token. We add them via Client Scopes.
+
+```
+Keycloak UI:
+Clients → supabase → Client scopes tab
+Click: supabase-dedicated
+Click: Add mapper → By configuration
+Choose: User Attribute
+```
+
+Add these mappers one by one:
+
+**Mapper 1 — role claim:**
+```
+Mapper type:      User Realm Role
+Name:             roles
+Token Claim Name: role
+Claim JSON Type:  String
+Add to ID token:          ON
+Add to access token:      ON
+Add to userinfo:          ON
+Save
+```
+
+**Mapper 2 — email claim:**
+```
+Mapper type:      User Property
+Name:             email
+Property:         email
+Token Claim Name: email
+Claim JSON Type:  String
+Add to access token: ON
+Save
+```
+
+---
+
+## Step 4: Get Keycloak JWT Public Key
+
+Supabase needs this to verify tokens are real.
+
+```bash
+# Get your Keycloak route URL
+KEYCLOAK_URL=$(oc get route keycloak \
+  -n moizaleem21-dev \
+  -o jsonpath='{.spec.host}')
+
+# Fetch the JWKS (public keys) endpoint
+curl -s https://$KEYCLOAK_URL/realms/aiops-dev/protocol/openid-connect/certs \
+  | python3 -m json.tool
+
+# Save this URL — needed for Supabase config:
+echo "JWKS URL: https://$KEYCLOAK_URL/realms/aiops-dev/protocol/openid-connect/certs"
+
+# Also get the JWT issuer URL:
+echo "Issuer URL: https://$KEYCLOAK_URL/realms/aiops-dev"
+```
+
+---
+
+## Step 5: Get RSA Public Key (PEM format)
+
+```bash
+# Fetch public key in PEM format
+curl -s https://$KEYCLOAK_URL/realms/aiops-dev \
+  | python3 -c "
+import sys, json, base64, textwrap
+data = json.load(sys.stdin)
+key = data['public_key']
+pem = '-----BEGIN PUBLIC KEY-----\n'
+pem += '\n'.join(textwrap.wrap(key, 64))
+pem += '\n-----END PUBLIC KEY-----'
+print(pem)
+" > /tmp/keycloak-public-key.pem
+
+# Show the key
+cat /tmp/keycloak-public-key.pem
+
+# Copy this entire key — needed for Supabase values.yaml
+```
+
+---
+
+# PHASE 2 — Configure Supabase Side
+
+## Step 6: Update Supabase Helm Values
+
+```bash
+# First get current Supabase values
+helm get values supabase -n moizaleem21-dev > /tmp/current-supabase-values.yaml
+cat /tmp/current-supabase-values.yaml
+```
+
+Create updated values file:
+
+```bash
+cat > environments/dev/supabase-keycloak-values.yaml << 'EOF'
+# ============================================================
+# Supabase Values — Keycloak Integration
+# ============================================================
+
+auth:
+  # ┌─────────────────────────────────────────────────────┐
+  # │  KEYCLOAK AS EXTERNAL JWT PROVIDER                  │
+  # │  Supabase will trust tokens issued by Keycloak      │
+  # └─────────────────────────────────────────────────────┘
+
+  # Disable Supabase built-in auth (we use Keycloak)
+  enabled: true
+
+  environment:
+    # JWT Secret — must match what Keycloak uses
+    # Generate: openssl rand -base64 32
+    GOTRUE_JWT_SECRET: "your-jwt-secret-here"
+    GOTRUE_JWT_EXP: 3600
+    GOTRUE_JWT_DEFAULT_GROUP_NAME: "authenticated"
+
+    # Keycloak as OIDC provider
+    GOTRUE_EXTERNAL_KEYCLOAK_ENABLED: "true"
+    GOTRUE_EXTERNAL_KEYCLOAK_CLIENT_ID: "supabase"
+    GOTRUE_EXTERNAL_KEYCLOAK_SECRET: "your-client-secret-from-keycloak"
+    GOTRUE_EXTERNAL_KEYCLOAK_REDIRECT_URI: "https://<supabase-route>/auth/v1/callback"
+
+    # Keycloak URLs (replace with your actual route)
+    GOTRUE_EXTERNAL_KEYCLOAK_URL: "https://<keycloak-route>/realms/aiops-dev"
+
+    # Site URL (Supabase Studio URL)
+    API_EXTERNAL_URL: "https://<supabase-route>"
+    GOTRUE_SITE_URL: "https://<supabase-studio-route>"
+
+    # Additional redirect URLs allowed
+    GOTRUE_URI_ALLOW_LIST: "https://<supabase-studio-route>/*"
+
+# ─── PostgREST — Row Level Security via JWT ───────────────
+rest:
+  environment:
+    # This tells PostgREST to verify JWT tokens from Keycloak
+    PGRST_JWT_SECRET: "your-jwt-secret-here"
+    # Keycloak issuer URL
+    PGRST_JWT_AUD: "supabase"
+
+# ─── Kong API Gateway ─────────────────────────────────────
+kong:
+  environment:
+    SUPABASE_ANON_KEY: "your-anon-key"
+    SUPABASE_SERVICE_KEY: "your-service-key"
+EOF
+```
+
+---
+
+## Step 7: Generate JWT Keys for Supabase
+
+Supabase needs JWT keys that match what Keycloak uses:
+
+```bash
+# Step 1: Generate JWT secret
+JWT_SECRET=$(openssl rand -base64 32)
+echo "JWT Secret: $JWT_SECRET"
+# SAVE THIS VALUE
+
+# Step 2: Generate Supabase anon key
+# This is a JWT token signed with above secret
+# Role: anon (public access)
+python3 << 'PYEOF'
+import jwt
+import datetime
+
+secret = "YOUR_JWT_SECRET_HERE"  # paste the one generated above
+
+anon_payload = {
+    "role": "anon",
+    "iss": "supabase",
+    "iat": int(datetime.datetime.now().timestamp()),
+    "exp": int((datetime.datetime.now() + datetime.timedelta(days=365*10)).timestamp())
+}
+
+service_payload = {
+    "role": "service_role",
+    "iss": "supabase",
+    "iat": int(datetime.datetime.now().timestamp()),
+    "exp": int((datetime.datetime.now() + datetime.timedelta(days=365*10)).timestamp())
+}
+
+anon_key = jwt.encode(anon_payload, secret, algorithm="HS256")
+service_key = jwt.encode(service_payload, secret, algorithm="HS256")
+
+print("ANON KEY:")
+print(anon_key)
+print("\nSERVICE KEY:")
+print(service_key)
+PYEOF
+
+# Install PyJWT if needed
+pip3 install PyJWT --break-system-packages
+```
+
+---
+
+## Step 8: Create Secrets for Supabase
+
+```bash
+# Create Supabase + Keycloak integration secret
+oc create secret generic supabase-keycloak-secret \
+  --from-literal=jwt-secret="YOUR_JWT_SECRET" \
+  --from-literal=anon-key="YOUR_ANON_KEY" \
+  --from-literal=service-key="YOUR_SERVICE_KEY" \
+  --from-literal=keycloak-client-secret="YOUR_KEYCLOAK_CLIENT_SECRET" \
+  -n moizaleem21-dev
+
+# Verify
+oc get secret supabase-keycloak-secret -n moizaleem21-dev
+```
+
+---
+
+## Step 9: Update supabase-keycloak-values.yaml with Real Values
+
+```bash
+# Get your actual URLs first
+KEYCLOAK_URL=$(oc get route keycloak \
+  -n moizaleem21-dev \
+  -o jsonpath='{.spec.host}')
+
+SUPABASE_URL=$(oc get route -n moizaleem21-dev \
+  | grep -i supa | awk '{print $2}' | head -1)
+
+echo "Keycloak URL: $KEYCLOAK_URL"
+echo "Supabase URL: $SUPABASE_URL"
+
+# Now edit the values file with real URLs:
+sed -i "s|<keycloak-route>|$KEYCLOAK_URL|g" \
+  environments/dev/supabase-keycloak-values.yaml
+
+sed -i "s|<supabase-route>|$SUPABASE_URL|g" \
+  environments/dev/supabase-keycloak-values.yaml
+```
+
+---
+
+## Step 10: Apply Supabase Upgrade
+
+```bash
+# Get current Supabase release name
+helm list -n moizaleem21-dev | grep -i supa
+
+# Upgrade Supabase with Keycloak config
+# Replace 'supabase' with your actual release name
+helm upgrade supabase supabase/supabase \
+  --namespace moizaleem21-dev \
+  --values /tmp/current-supabase-values.yaml \
+  --values environments/dev/supabase-keycloak-values.yaml \
+  --wait \
+  --timeout 5m
+
+# Watch pods restart
+oc get pods -n moizaleem21-dev -w
+```
+
+---
+
+# PHASE 3 — Database Row Level Security (RLS)
+
+## Step 11: Enable RLS on Supabase Tables
+
+This ensures only Keycloak-authenticated users can access AIOps data:
+
+```bash
+# Connect to Supabase PostgreSQL
+SUPA_DB_POD=$(oc get pods -n moizaleem21-dev \
+  | grep -i "supabase.*db\|postgres" \
+  | awk '{print $1}' | head -1)
+
+oc exec -it $SUPA_DB_POD \
+  -n moizaleem21-dev -- psql -U postgres
+```
+
+Inside psql run these SQL commands:
+
+```sql
+-- ============================================================
+-- STEP 1: Create custom JWT validation function
+-- This reads role from Keycloak JWT token
+-- ============================================================
+CREATE OR REPLACE FUNCTION auth.jwt_role()
+RETURNS text AS $$
+  SELECT coalesce(
+    current_setting('request.jwt.claims', true)::json->>'role',
+    'anon'
+  )
+$$ LANGUAGE sql STABLE;
+
+-- ============================================================
+-- STEP 2: Example — Enable RLS on your AIOps data table
+-- ============================================================
+-- Enable RLS on table (replace 'aiops_events' with your table)
+ALTER TABLE public.aiops_events ENABLE ROW LEVEL SECURITY;
+
+-- Policy: only authenticated users can read
+CREATE POLICY "authenticated users can read aiops data"
+  ON public.aiops_events
+  FOR SELECT
+  USING (auth.jwt_role() = 'authenticated');
+
+-- Policy: only ml-engineer role can insert
+CREATE POLICY "ml engineers can insert data"
+  ON public.aiops_events
+  FOR INSERT
+  WITH CHECK (
+    current_setting('request.jwt.claims', true)::json
+    ->'realm_access'->'roles' @> '["ml-engineer"]'
+  );
+
+-- Policy: only aiops-admin can delete
+CREATE POLICY "admins can delete"
+  ON public.aiops_events
+  FOR DELETE
+  USING (
+    current_setting('request.jwt.claims', true)::json
+    ->'realm_access'->'roles' @> '["aiops-admin"]'
+  );
+
+-- Verify RLS is enabled
+SELECT tablename, rowsecurity
+FROM pg_tables
+WHERE schemaname = 'public';
+```
+
+---
+
+# PHASE 4 — Test the Integration
+
+## Step 12: Test Full Flow
+
+```bash
+KEYCLOAK_URL=$(oc get route keycloak \
+  -n moizaleem21-dev \
+  -o jsonpath='{.spec.host}')
+
+SUPABASE_URL=$(oc get route -n moizaleem21-dev \
+  | grep -i supa | awk '{print $2}' | head -1)
+
+# ─── Step 1: Get token from Keycloak ──────────────────────
+KC_TOKEN=$(curl -s -k \
+  -X POST \
+  "https://$KEYCLOAK_URL/realms/aiops-dev/protocol/openid-connect/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=testuser" \
+  -d "password=Test@12345" \
+  -d "grant_type=password" \
+  -d "client_id=supabase" \
+  -d "client_secret=YOUR_CLIENT_SECRET" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+echo "Got token: ${KC_TOKEN:0:50}..."
+
+# ─── Step 2: Use token to query Supabase ──────────────────
+curl -s -k \
+  "https://$SUPABASE_URL/rest/v1/aiops_events?limit=5" \
+  -H "Authorization: Bearer $KC_TOKEN" \
+  -H "apikey: YOUR_ANON_KEY" \
+  | python3 -m json.tool
+
+# Expected: data returned if user has correct role
+# Expected: 401/403 if token invalid or wrong role
+```
+
+---
+
+## Step 13: Test Supabase Studio Protected by Keycloak
+
+```bash
+# Open Supabase Studio in browser
+echo "Supabase Studio: https://$SUPABASE_URL"
+
+# It should now redirect to Keycloak login page
+# Login with: testuser / Test@12345
+# After login → redirected back to Supabase Studio
+```
+
+---
+
+# PHASE 5 — AIOps Service Integration
+
+## Step 14: Python Example — AIOps Service Using Keycloak + Supabase
+
+```python
+# aiops_service/supabase_client.py
+# How your AIOps ML services query Supabase with Keycloak auth
+
+import httpx
+import os
+
+KEYCLOAK_URL = os.getenv("KEYCLOAK_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+async def get_keycloak_token(username: str, password: str) -> str:
+    """Get JWT token from Keycloak"""
+    async with httpx.AsyncClient(verify=False) as client:
+        response = await client.post(
+            f"{KEYCLOAK_URL}/realms/aiops-dev"
+            f"/protocol/openid-connect/token",
+            data={
+                "username": username,
+                "password": password,
+                "grant_type": "password",
+                "client_id": "supabase",
+                "client_secret": os.getenv("KC_CLIENT_SECRET"),
+            }
+        )
+        return response.json()["access_token"]
+
+async def query_aiops_data(token: str, table: str) -> dict:
+    """Query Supabase using Keycloak token"""
+    async with httpx.AsyncClient(verify=False) as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={
+                # Keycloak JWT token here
+                "Authorization": f"Bearer {token}",
+                # Supabase anon key
+                "apikey": SUPABASE_ANON_KEY,
+                "Content-Type": "application/json",
+            }
+        )
+        return response.json()
+
+# Usage in your AIOps pipeline:
+async def main():
+    # 1. Get token from Keycloak
+    token = await get_keycloak_token("ml-service-user", "password")
+
+    # 2. Query AIOps data from Supabase
+    anomalies = await query_aiops_data(token, "aiops_events")
+    logs = await query_aiops_data(token, "log_analysis")
+    metrics = await query_aiops_data(token, "system_metrics")
+
+    print(f"Got {len(anomalies)} anomaly records")
+    return anomalies
+```
+
+---
+
+# Summary of What We Did
+
+```
+INTEGRATION ARCHITECTURE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AIOps Service / User
+        ↓
+   1. Login to Keycloak
+        ↓
+   2. Get JWT Token (contains role: ml-engineer etc.)
+        ↓
+   3. Call Supabase API with token in header
+        ↓
+   4. Supabase verifies token signature with
+      Keycloak public key
+        ↓
+   5. PostgREST checks Row Level Security policies
+        ↓
+   6. Only correct role gets data back
+
+KEYCLOAK SIDE:
+  ✅ supabase client created
+  ✅ role claim added to JWT token
+  ✅ JWKS endpoint exposed for Supabase
+
+SUPABASE SIDE:
+  ✅ Keycloak as OIDC provider
+  ✅ JWT verification against Keycloak
+  ✅ Row Level Security on AIOps tables
+
+DATABASE SIDE:
+  ✅ RLS enabled on tables
+  ✅ Policies per Keycloak role
+  ✅ Only authenticated users see data
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+Now run these commands and paste output:
+
+```bash
+# Let me see your actual setup
+oc get pods -n moizaleem21-dev | grep -iv keycloak
+helm list -n moizaleem21-dev
+oc get route -n moizaleem21-dev
+```
+
+This way I can give you **exact values** instead of placeholders and we fix any errors that come up! 🚀
